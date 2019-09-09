@@ -267,6 +267,10 @@ MavlinkReceiver::handle_message(mavlink_message_t *msg)
 		handle_message_gripper_servo(msg);
         	break;
 
+	case MAVLINK_MSG_ID_MISSION_HEIGHT_SETPOINT:
+		handle_message_mission_height_setpoint(msg);
+        	break;
+
 	default:
 		break;
 	}
@@ -566,6 +570,27 @@ MavlinkReceiver::handle_message_gripper_servo(mavlink_message_t *msg)
 
     } else {
         orb_publish(ORB_ID(gripper_servo), _gripper_servo_pub, &key);
+    }
+
+}
+
+void
+MavlinkReceiver::handle_message_mission_height_setpoint(mavlink_message_t *msg)
+{
+    mavlink_mission_height_setpoint_t man;
+    mavlink_msg_mission_height_setpoint_decode(msg, &man);
+
+    struct mission_height_setpoint_s key;
+    memset(&key, 0, sizeof(key));
+
+    key.timestamp = hrt_absolute_time();
+    key.height = man.height;
+
+    if (_mission_height_setpoint_pub == nullptr) {
+        _mission_height_setpoint_pub = orb_advertise(ORB_ID(mission_height_setpoint), &key);
+
+    } else {
+        orb_publish(ORB_ID(mission_height_setpoint), _mission_height_setpoint_pub, &key);
     }
 
 }

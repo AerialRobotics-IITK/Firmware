@@ -75,6 +75,7 @@ set(msg_files
 	manual_control_setpoint.msg
 	mavlink_log.msg
 	mission.msg
+	mission_height_setpoint.msg
 	mission_result.msg
 	mount_orientation.msg
 	multirotor_motor_limits.msg
