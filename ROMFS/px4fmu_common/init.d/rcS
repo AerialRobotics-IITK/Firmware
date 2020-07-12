@@ -27,7 +27,6 @@ set FAILSAFE none
 set FAILSAFE_AUX none
 set FCONFIG /fs/microsd/etc/config.txt
 set FEXTRAS /fs/microsd/etc/extras.txt
-set FMU_ARGS ""
 set FMU_MODE pwm
 set FRC /fs/microsd/etc/rc.txt
 set IOFW "/etc/extras/px4_io-v2_default.bin"
@@ -102,6 +101,33 @@ then
 			hardfault_log reset
 		fi
 	fi
+
+	# Prevent MacOS and Ubuntu from creating unnecessary temporary files on the microSD card
+
+	# block MacOS Spotlight indexing (.Spotlight-V100 folder)
+	if [ ! -f "/fs/microsd/.metadata_never_index" ]; then
+		cat > /fs/microsd/.metadata_never_index
+	fi
+
+	# block MacOS trashes
+	if [ ! -f "/fs/microsd/.Trashes" ]; then
+		cat > /fs/microsd/.Trashes
+	fi
+
+	# block MacOS logging of filesystem events
+	if [ ! -d "/fs/microsd/.fseventsd" ]; then
+		mkdir /fs/microsd/.fseventsd
+	fi
+
+	if [ ! -f "/fs/microsd/.fseventsd/no_log" ]; then
+		cat > /fs/microsd/.fseventsd/no_log
+	fi
+
+	# block Ubuntu trash
+	if [ ! -f "/fs/microsd/.Trash-1000" ]; then
+		cat > /fs/microsd/.Trash-1000
+	fi
+
 else
 	# tune SD_INIT
 	set STARTUP_TUNE 16
@@ -153,8 +179,8 @@ else
 	then
 		if param compare SYS_AUTOCONFIG 1
 		then
-			# Wipe out params except RC*, flight modes, total flight time, accel cal, gyro cal
-			param reset_nostart RC* COM_FLTMODE* LND_FLIGHT_T_* TC_* CAL_ACC* CAL_GYRO*
+			# Wipe out params except RC*, flight modes, total flight time, accel cal, gyro cal, next flight UUID
+			param reset_nostart RC* COM_FLTMODE* LND_FLIGHT_T_* TC_* CAL_ACC* CAL_GYRO* COM_FLIGHT_UUID
 		fi
 
 		set AUTOCNF yes
@@ -199,13 +225,15 @@ else
 	#
 	# Start system state indicator.
 	#
-	rgbled start
-	rgbled_ncp5623c start
-	rgbled_pwm start
+	rgbled start -X
+	rgbled_ncp5623c start -X
 
-	if blinkm start
+	if param greater LIGHT_EN_BLINKM 0
 	then
-		blinkm systemstate
+		if blinkm start -X
+		then
+			blinkm systemstate
+		fi
 	fi
 
 	#
@@ -214,11 +242,6 @@ else
 	# Note that this will still play the already published startup tone.
 	#
 	tone_alarm start
-
-	if param compare SYS_FMU_TASK 1
-	then
-		set FMU_ARGS "-t"
-	fi
 
 	#
 	# Set parameters and env variables for selected AUTOSTART.
@@ -301,7 +324,7 @@ else
 	#
 	# Set USE_IO flag.
 	#
-	if param compare SYS_USE_IO 1
+	if param compare -s SYS_USE_IO 1
 	then
 		set USE_IO yes
 	fi
@@ -314,6 +337,12 @@ else
 	fi
 
 	#
+	# RC update (map raw RC input to calibrate manual control)
+	#  start before commander
+	#
+	rc_update start
+
+	#
 	# Sensors System (start before Commander so Preflight checks are properly run).
 	# Commander needs to be this early for in-air-restarts.
 	#
@@ -321,7 +350,7 @@ else
 	then
 		set OUTPUT_MODE hil
 		sensors start -h
-		commander start --hil
+		commander start -h
 		# disable GPS
 		param set GPS_1_CONFIG 0
 
@@ -343,13 +372,32 @@ else
 		fi
 		unset BOARD_RC_SENSORS
 
-
 		sh /etc/init.d/rc.sensors
+
+		if param compare -s BAT1_SOURCE 2
+		then
+			esc_battery start
+		fi
+
+		if ! param compare BAT1_SOURCE 1
+		then
+			battery_status start
+		fi
+
 		commander start
 	fi
 
 	# Sensors on the PWM interface bank.
-	if param compare SENS_EN_LL40LS 1
+	if param compare -s SENS_EN_LL40LS 1
+	then
+		# Clear pins 5 and 6.
+		set FMU_MODE pwm4
+		set AUX_MODE pwm4
+	fi
+
+
+	# Check if ATS is enabled
+	if param compare FD_EXT_ATS_EN 1
 	then
 		# Clear pins 5 and 6.
 		set FMU_MODE pwm4
@@ -376,7 +424,7 @@ else
 	#
 	# Check if UAVCAN is enabled, default to it for ESCs.
 	#
-	if param greater UAVCAN_ENABLE 0
+	if param greater -s UAVCAN_ENABLE 0
 	then
 		# Start core UAVCAN module.
 		if uavcan start
@@ -398,9 +446,15 @@ else
 	fi
 
 	#
-	# Start mavlink streams that are not configurable (e.g. on USB).
+	# Optional board mavlink streams: rc.board_mavlink
 	#
-	sh /etc/init.d/rc.mavlink
+	set BOARD_RC_MAVLINK /etc/init.d/rc.board_mavlink
+	if [ -f $BOARD_RC_MAVLINK ]
+	then
+		echo "Board extras: ${BOARD_RC_MAVLINK}"
+		sh $BOARD_RC_MAVLINK
+	fi
+	unset BOARD_RC_MAVLINK
 
 	#
 	# Start UART/Serial device drivers.
@@ -408,7 +462,7 @@ else
 	#
 	sh /etc/init.d/rc.serial
 
-	if [ $IO_PRESENT = no -o $USE_IO = no ]
+	if [ $IO_PRESENT = no ]
 	then
 		# Must be started after the serial config is read
 		rc_input start $RC_INPUT_ARGS
@@ -422,7 +476,7 @@ else
 	sh /etc/init.d/rc.vehicle_setup
 
 	# Camera capture driver
-	if param greater CAM_CAP_FBACK 0
+	if param greater -s CAM_CAP_FBACK 0
 	then
 		if camera_capture start
 		then
@@ -434,14 +488,6 @@ else
 	# Start the navigator.
 	#
 	navigator start
-
-	#
-	# Start the standalone wind estimator.
-	#
-	if param compare WEST_EN 1
-	then
-		wind_estimator start
-	fi
 
 	#
 	# Start a thermal calibration if required.
@@ -456,13 +502,16 @@ else
 		vmount start
 	fi
 
-	# Check for flow sensor, launched as a background task to scan
-	px4flow start &
+	# Check for flow sensor
+	if param compare SENS_EN_PX4FLOW 1
+	then
+		px4flow start -X
+	fi
 
 	# Blacksheep telemetry
 	if param greater TEL_BST_EN 0
 	then
-		bst start
+		bst start -X
 	fi
 
 	#
@@ -490,6 +539,13 @@ else
 	#
 	sh /etc/init.d/rc.logging
 
+	#
+	# Set additional parameters and env variables for selected AUTOSTART.
+	#
+	if ! param compare SYS_AUTOSTART 0
+	then
+		sh /etc/init.d/rc.autostart.post
+	fi
 
 	if ! param compare SYS_PARAM_VER ${PARAM_DEFAULTS_VER}
 	then
@@ -515,7 +571,6 @@ unset FAILSAFE
 unset FAILSAFE_AUX
 unset FCONFIG
 unset FEXTRAS
-unset FMU_ARGS
 unset FMU_MODE
 unset FRC
 unset IO_PRESENT

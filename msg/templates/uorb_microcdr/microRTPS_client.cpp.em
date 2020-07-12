@@ -14,18 +14,20 @@
 import os
 
 import genmsg.msgs
-import gencpp
+
 from px_generate_uorb_topic_helper import * # this is in Tools/
 from px_generate_uorb_topic_files import MsgScope # this is in Tools/
 
-topic_names = [single_spec.short_name for single_spec in spec]
-send_topics = [s.short_name for idx, s in enumerate(spec) if scope[idx] == MsgScope.SEND]
-recv_topics = [s.short_name for idx, s in enumerate(spec) if scope[idx] == MsgScope.RECEIVE]
+topic_names = [s.short_name for s in spec]
+send_topics = [(alias[idx] if alias[idx] else s.short_name) for idx, s in enumerate(spec) if scope[idx] == MsgScope.SEND]
+send_base_types = [s.short_name for idx, s in enumerate(spec) if scope[idx] == MsgScope.SEND]
+recv_topics = [(alias[idx] if alias[idx] else s.short_name) for idx, s in enumerate(spec) if scope[idx] == MsgScope.RECEIVE]
+receive_base_types = [s.short_name for idx, s in enumerate(spec) if scope[idx] == MsgScope.RECEIVE]
 }@
 /****************************************************************************
  *
  * Copyright (c) 2017 Proyectos y Sistemas de Mantenimiento SL (eProsima).
- * Copyright (c) 2018 PX4 Development Team. All rights reserved.
+ * Copyright (c) 2018-2019 PX4 Development Team. All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without
  * modification, are permitted provided that the following conditions are met:
@@ -67,12 +69,17 @@ recv_topics = [s.short_name for idx, s in enumerate(spec) if scope[idx] == MsgSc
 #include <px4_time.h>
 #include <uORB/uORB.h>
 
+#include <uORB/Publication.hpp>
+#include <uORB/Subscription.hpp>
 @[for topic in list(set(topic_names))]@
 #include <uORB/topics/@(topic).h>
 #include <uORB_microcdr/topics/@(topic).h>
 @[end for]@
 
 void* send(void *data);
+
+uint8_t last_remote_msg_seq = 0;
+uint8_t last_msg_seq = 0;
 
 @[if send_topics]@
 void* send(void* /*unused*/)
@@ -81,57 +88,59 @@ void* send(void* /*unused*/)
     uint64_t sent = 0, total_sent = 0;
     int loop = 0, read = 0;
     uint32_t length = 0;
-    uint16_t header_length = 0;
+    size_t header_length = 0;
 
     /* subscribe to topics */
-    int fds[@(len(send_topics))] = {};
-
-    // orb_set_interval statblish an update interval period in milliseconds.
 @[for idx, topic in enumerate(send_topics)]@
-    fds[@(idx)] = orb_subscribe(ORB_ID(@(topic)));
-    orb_set_interval(fds[@(idx)], _options.update_time_ms);
+    uORB::Subscription @(topic)_sub{ORB_ID(@(topic))};
 @[end for]@
 
     // ucdrBuffer to serialize using the user defined buffer
     ucdrBuffer writer;
-    header_length=transport_node->get_header_length();
-    ucdr_init_buffer(&writer, (uint8_t*)&data_buffer[header_length], BUFFER_SIZE - header_length);
+    header_length = transport_node->get_header_length();
+    ucdr_init_buffer(&writer, reinterpret_cast<uint8_t*>(&data_buffer[header_length]), BUFFER_SIZE - header_length);
 
     struct timespec begin;
     px4_clock_gettime(CLOCK_REALTIME, &begin);
 
     while (!_should_exit_task)
     {
-        bool updated;
 @[for idx, topic in enumerate(send_topics)]@
-        orb_check(fds[@(idx)], &updated);
-        if (updated)
-        {
-            // obtained data for the file descriptor
-            struct @(topic)_s data;
-            // copy raw data into local buffer
-            if (orb_copy(ORB_ID(@(topic)), fds[@(idx)], &data) == 0) {
-                /* payload is shifted by header length to make room for header*/
-                serialize_@(topic)(&writer, &data, &data_buffer[header_length], &length);
+        @(send_base_types[idx])_s @(topic)_data;
+        if (@(topic)_sub.update(&@(topic)_data)) {
+@[if topic == 'Timesync' or topic == 'timesync']@
+            if(@(topic)_data.sys_id == 0 && @(topic)_data.seq != last_remote_msg_seq && @(topic)_data.tc1 == 0) {
+                last_remote_msg_seq = @(topic)_data.seq;
 
-                if (0 < (read = transport_node->write((char)@(rtps_message_id(ids, topic)), data_buffer, length)))
+                @(topic)_data.timestamp = hrt_absolute_time();
+                @(topic)_data.sys_id = 1;
+                @(topic)_data.seq = last_msg_seq;
+                @(topic)_data.tc1 = hrt_absolute_time() * 1000ULL;
+                @(topic)_data.ts1 = @(topic)_data.ts1;
+
+                last_msg_seq++;
+@[end if]@
+                // copy raw data into local buffer. Payload is shifted by header length to make room for header
+                serialize_@(send_base_types[idx])(&writer, &@(topic)_data, &data_buffer[header_length], &length);
+                if (0 < (read = transport_node->write(static_cast<char>(@(rtps_message_id(ids, topic))), data_buffer, length)))
                 {
                     total_sent += read;
                     ++sent;
                 }
+@[if topic == 'Timesync' or topic == 'timesync']@
             }
+@[end if]@
         }
 @[end for]@
-
-        px4_usleep(_options.sleep_ms*1000);
+        px4_usleep(_options.sleep_ms * 1000);
         ++loop;
     }
 
     struct timespec end;
     px4_clock_gettime(CLOCK_REALTIME, &end);
-    double elapsed_secs = double(end.tv_sec - begin.tv_sec) + double(end.tv_nsec - begin.tv_nsec)/double(1000000000);
+    double elapsed_secs = end.tv_sec - begin.tv_sec + (end.tv_nsec - begin.tv_nsec) / 1e9;
     PX4_INFO("SENT: %" PRIu64 " messages in %d LOOPS, %" PRIu64 " bytes in %.03f seconds - %.02fKB/s",
-            sent, loop, total_sent, elapsed_secs, (double)total_sent/(1000*elapsed_secs));
+                sent, loop, total_sent, elapsed_secs, total_sent / (1e3 * elapsed_secs));
 
     return nullptr;
 }
@@ -152,7 +161,7 @@ static int launch_send_thread(pthread_t &sender_thread)
 }
 @[end if]@
 
-void micrortps_start_topics(struct timespec &begin, int &total_read, uint32_t &received, int &loop)
+void micrortps_start_topics(struct timespec &begin, uint64_t &total_read, uint64_t &received, int &loop)
 {
 @[if recv_topics]@
 
@@ -161,14 +170,14 @@ void micrortps_start_topics(struct timespec &begin, int &total_read, uint32_t &r
     uint8_t topic_ID = 255;
 
     // Declare received topics
-@[for topic in recv_topics]@
-    struct @(topic)_s @(topic)_data;
-    orb_advert_t @(topic)_pub = nullptr;
+@[for idx, topic in enumerate(recv_topics)]@
+    @(receive_base_types[idx])_s @(topic)_data;
+    uORB::Publication<@(receive_base_types[idx])_s> @(topic)_pub{ORB_ID(@(topic))};
 @[end for]@
 
     // ucdrBuffer to deserialize using the user defined buffer
     ucdrBuffer reader;
-    ucdr_init_buffer(&reader, (uint8_t*)data_buffer, BUFFER_SIZE);
+    ucdr_init_buffer(&reader, reinterpret_cast<uint8_t*>(data_buffer), BUFFER_SIZE);
 @[end if]@
 
     px4_clock_gettime(CLOCK_REALTIME, &begin);
@@ -188,16 +197,11 @@ void micrortps_start_topics(struct timespec &begin, int &total_read, uint32_t &r
             total_read += read;
             switch (topic_ID)
             {
-@[for topic in recv_topics]@
-
+@[for idx, topic in enumerate(recv_topics)]@
                 case @(rtps_message_id(ids, topic)):
                 {
-                    deserialize_@(topic)(&reader, &@(topic)_data, data_buffer);
-                    if (!@(topic)_pub) {
-                        @(topic)_pub = orb_advertise(ORB_ID(@(topic)), &@(topic)_data);
-                    } else {
-                        orb_publish(ORB_ID(@(topic)), @(topic)_pub, &@(topic)_data);
-                    }
+                    deserialize_@(receive_base_types[idx])(&reader, &@(topic)_data, data_buffer);
+                    @(topic)_pub.publish(@(topic)_data);
                     ++received;
                 }
                 break;
@@ -212,7 +216,7 @@ void micrortps_start_topics(struct timespec &begin, int &total_read, uint32_t &r
         // loop forever if informed loop number is negative
         if (_options.loops >= 0 && loop >= _options.loops) break;
 
-        px4_usleep(_options.sleep_ms*1000);
+        px4_usleep(_options.sleep_ms * 1000);
         ++loop;
     }
 @[if send_topics]@
