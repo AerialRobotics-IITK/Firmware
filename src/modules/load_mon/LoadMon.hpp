@@ -1,6 +1,6 @@
 /****************************************************************************
  *
- *   Copyright (c) 2017 PX4 Development Team. All rights reserved.
+ *   Copyright (c) 2012-2020 PX4 Development Team. All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without
  * modification, are permitted provided that the following conditions
@@ -31,38 +31,65 @@
  *
  ****************************************************************************/
 
-/**
- * @file FlightManualPositionSmooth.cpp
- */
+#pragma once
 
-#include "FlightTaskManualPositionSmooth.hpp"
+#include <drivers/drv_hrt.h>
+#include <lib/perf/perf_counter.h>
+#include <px4_platform_common/px4_config.h>
+#include <px4_platform_common/defines.h>
+#include <px4_platform_common/module.h>
+#include <px4_platform_common/module_params.h>
+#include <px4_platform_common/px4_work_queue/ScheduledWorkItem.hpp>
+#include <systemlib/cpuload.h>
+#include <uORB/Publication.hpp>
+#include <uORB/topics/cpuload.h>
+#include <uORB/topics/task_stack_info.h>
 
-using namespace matrix;
-
-FlightTaskManualPositionSmooth::FlightTaskManualPositionSmooth() :
-	_smoothingXY(this, Vector2f(_velocity)),
-	_smoothingZ(this, _velocity(2), _sticks.getPosition()(2))
-{}
-
-void FlightTaskManualPositionSmooth::_updateSetpoints()
+namespace load_mon
 {
-	/* Get yaw setpont, un-smoothed position setpoints.*/
-	FlightTaskManualPosition::_updateSetpoints();
 
-	/* Smooth velocity setpoint in xy.*/
-	Vector2f vel(_velocity);
-	Vector2f vel_sp_xy(_velocity_setpoint);
-	_smoothingXY.updateMaxVelocity(_constraints.speed_xy);
-	_smoothingXY.smoothVelocity(vel_sp_xy, vel, _yaw, _yawspeed_setpoint, _deltatime);
-	_velocity_setpoint(0) = vel_sp_xy(0);
-	_velocity_setpoint(1) = vel_sp_xy(1);
+class LoadMon : public ModuleBase<LoadMon>, public ModuleParams, public px4::ScheduledWorkItem
+{
+public:
+	LoadMon();
+	~LoadMon() override;
 
-	/* Check for xy position lock.*/
-	_updateXYlock();
+	static int task_spawn(int argc, char *argv[]);
 
-	/* Smooth velocity in z.*/
-	_smoothingZ.smoothVelFromSticks(_velocity_setpoint(2), _deltatime);
+	/** @see ModuleBase */
+	static int custom_command(int argc, char *argv[])
+	{
+		return print_usage("unknown command");
+	}
 
-	/* Check for altitude lock*/
-	_updateAltitudeLock();
-}
+	/** @see ModuleBase */
+	static int print_usage(const char *reason = nullptr);
+
+	void start();
+
+private:
+	/** Do a compute and schedule the next cycle. */
+	void Run() override;
+
+	/** Do a calculation of the CPU load and publish it. */
+	void cpuload();
+
+	/* Calculate stack usage */
+	void stack_usage();
+
+	int _stack_task_index{0};
+
+	uORB::PublicationQueued<task_stack_info_s> _task_stack_info_pub{ORB_ID(task_stack_info)};
+	uORB::Publication<cpuload_s> _cpuload_pub{ORB_ID(cpuload)};
+
+	hrt_abstime _last_idle_time{0};
+	hrt_abstime _last_idle_time_sample{0};
+
+	perf_counter_t _cycle_perf{perf_alloc(PC_ELAPSED, MODULE_NAME": cycle")};
+
+	DEFINE_PARAMETERS(
+		(ParamBool<px4::params::SYS_STCK_EN>) _param_sys_stck_en
+	)
+};
+
+} // namespace load_mon
