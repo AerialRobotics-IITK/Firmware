@@ -63,6 +63,8 @@ LIS2MDL::~LIS2MDL()
 	perf_free(_comms_errors);
 	perf_free(_range_errors);
 	perf_free(_conf_errors);
+
+	delete _interface;
 }
 
 int
@@ -100,7 +102,6 @@ LIS2MDL::measure()
 	if (ret != OK) {
 		perf_end(_sample_perf);
 		perf_count(_comms_errors);
-		PX4_WARN("Register read error.");
 		return ret;
 	}
 
